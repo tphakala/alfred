@@ -33,7 +33,7 @@ Current MVP scope (foundation plan): Claude runner only, single-phase, scheduled
 
 ## Supervised Orchestration (in progress, since 2026-07-08)
 
-Alfred is being extended into a generic, Temporal-native supervised multi-agent orchestrator. Design spec: `docs/superpowers/specs/2026-07-08-generic-supervised-orchestration-design.md` (kept in the working tree, uncommitted, like the other superpowers design docs). Roadmap and progress are tracked in Forgejo issue #60.
+Alfred is being extended into a generic, Temporal-native supervised multi-agent orchestrator. Design spec: `docs/superpowers/specs/2026-07-08-generic-supervised-orchestration-design.md` (kept in the working tree, uncommitted, like the other superpowers design docs). Roadmap and progress are tracked in issue #16.
 
 **Operator/developer guide (committed):** `docs/supervised-orchestration-guide.md` is the recipe for building and running a supervised (`queue_monitor`) workflow: the interaction surface, host helper scripts (prefilter + declared-command tools), the AgentConfig schema and validation rules, the deploy layout on this host, the register-then-pause flow, the `#122` schedule-recreate gotcha, the four verification windows, model/provider notes, robustness design principles, and known limitations. Read it before creating a new supervised task instead of re-deriving any of that.
 
