@@ -1,0 +1,81 @@
+# Phase 4 demo: a queue_monitor task whose supervisor mixes both sub-agent
+# backends in one task. The "analysis" kind runs backend: native (an LLM loop
+# on Alfred's providers; terminal tools submit_result, schema-bound, and
+# report_failure); the "action" kind runs backend: cli (an
+# ExternalAgentWorkflow Claude session). Flipping a kind between backends is
+# config-only: the supervisor prompt does not change.
+#
+# The deployment must provide ~/bin/demo-prefilter emitting the candidate
+# format ({"candidates": [{"key": "...", "context": {...}}]}).
+name: native-demo-supervised
+strategy: queue_monitor
+description: Demo of mixed native and cli sub-agent backends in one supervised task
+
+schedule:
+  cron: "0 8 * * *"
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+prefilter:
+  type: command
+  command: ~/bin/demo-prefilter --candidates
+
+monitor:
+  max_parallel_cases: 2
+  max_new_cases_per_pass: 5
+  max_case_attempts: 3
+
+supervisor:
+  model: gemini-2.0-flash
+  prompt:
+    base: prompts/agents/native-demo-supervisor.md
+  max_rounds: 8
+  # cost_cap_usd meters the supervisor's own LLM token spend (priced per model
+  # from the built-in table, overridable via the top-level `pricing` config)
+  # plus spawned sub-agent cost, including a native child's own metered spend.
+  cost_cap_usd: 3.00
+  max_duration: 30m
+
+  sub_agents:
+    # Native backend: an LLM ReAct loop with a schema-bound final result.
+    analysis:
+      backend: native
+      native:
+        model: gemini-2.0-flash
+        prompt:
+          base: prompts/agents/native-demo-analysis.md
+        max_rounds: 6
+        output:
+          schema:
+            type: object
+            required: [summary, recommended_action]
+            properties:
+              summary:
+                type: string
+                description: One-paragraph analysis of the candidate.
+              recommended_action:
+                type: string
+                enum: [act, close, escalate, ignore]
+                description: What the supervisor should do next.
+
+    # CLI backend: an ExternalAgentWorkflow Claude session (pre-Phase-4 shape,
+    # backend key now explicit).
+    action:
+      backend: cli
+      runner: claude
+      phases:
+        - name: main
+          model: claude-opus-4-6
+          runner_flags:
+            max_turns: 20
+            max_budget_usd: 2.00
+          prompt:
+            base: prompts/agents/native-demo-action.md
+          steering:
+            mode: scheduled
+          output:
+            capture: text
+
+cleanup: []

@@ -1,0 +1,8 @@
+strategy: external_agent
+runner: claude
+phases:
+  - name: main
+    model: claude-sonnet-4-6
+    prompt: { base: x.md }
+    steering: { mode: scheduled }
+    output: { capture: text }

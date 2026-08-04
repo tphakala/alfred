@@ -1,0 +1,4 @@
+package: apiv1gen
+output: types.gen.go
+generate:
+  models: true

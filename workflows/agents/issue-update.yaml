@@ -1,0 +1,56 @@
+# Manually triggered only (no schedule.cron). Run via POST /api/agent-tasks/issue-update/run.
+name: issue-update
+strategy: external_agent
+runner: claude
+description: Post proactive updates on open GitHub issues for tphakala/birdnet-go
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+prefilter:
+  type: command
+  command: ~/bin/issue-prefilter update
+
+phases:
+  - name: main
+    model: claude-sonnet-4-6
+    runner_flags:
+      max_turns: 30
+      max_budget_usd: 2.00
+    prompt:
+      base: prompts/agents/issue-update.md
+      includes:
+        - prompts/agents/_voice.md
+    tools:
+      bash:
+        - "github-issues comment*"
+        - "github-issues label*"
+        - "github-issues show*"
+      builtin: [Read, WebFetch, WebSearch]
+      mcp:
+        servers:
+          hindsight-memory-birdnet-go-support:
+            type: http
+            url: http://localhost:8890/mcp/birdnet-go-support/
+    steering:
+      mode: scheduled
+    output:
+      capture: structured
+      schema:
+        type: object
+        required: [updated, skipped]
+        properties:
+          updated:
+            type: array
+            items: { type: integer }
+          skipped:
+            type: array
+            items:
+              type: object
+              required: [issue, reason]
+              properties:
+                issue: { type: integer }
+                reason: { type: string }
+
+cleanup: []

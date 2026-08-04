@@ -1,0 +1,14 @@
+-- deploy/alfred-temporal-init.sql.example
+--
+-- Runs once, on first boot of an empty Postgres data volume, via
+-- docker-entrypoint-initdb.d (see deploy/alfred-temporal-compose.yml.example).
+-- Substitute real passwords before use; do not commit real credentials.
+-- Alfred's own migrations (internal/store/migrations/) run separately at
+-- application startup and only need the "alfred" database + user to exist.
+
+CREATE USER temporal WITH PASSWORD 'CHANGE_ME_TEMPORAL_DB_PASSWORD';
+CREATE DATABASE temporal OWNER temporal;
+CREATE DATABASE temporal_visibility OWNER temporal;
+
+CREATE USER alfred WITH PASSWORD 'CHANGE_ME_ALFRED_DB_PASSWORD';
+CREATE DATABASE alfred OWNER alfred;

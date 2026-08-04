@@ -1,0 +1,75 @@
+# deploy/alfred-temporal-compose.yml.example
+#
+# A dedicated Postgres + Temporal stack for the native-binary deployment
+# shape (see deploy/README.md, "Native binary + separate Temporal stack").
+# Alfred itself runs OUTSIDE this stack, as a plain binary under
+# alfred.service.example, pointed at temporal.host in config.yaml.
+#
+# The single Postgres instance hosts two separate databases via the init
+# script below: Temporal's own schema (temporal, temporal_visibility) and
+# Alfred's application database (alfred). They are different concerns that
+# happen to share one Postgres container here for operational simplicity;
+# split them if that stops being appropriate for your deployment.
+#
+# Copy to compose.yml alongside deploy/alfred-temporal-init.sql.example
+# (as ./init/01-create-databases.sql, with real passwords substituted) and
+# a .env defining POSTGRES_SUPERUSER_PASSWORD, then:
+#   podman compose up -d   (or: docker compose up -d)
+# Requires an external bridge network named "alfred-net" to already exist
+# (podman network create alfred-net / docker network create alfred-net) --
+# adjust or drop the "networks:" blocks entirely to use the default network.
+
+services:
+  db:
+    image: docker.io/library/postgres:17-alpine
+    container_name: alfred-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data:Z
+      - ./init:/docker-entrypoint-initdb.d:ro,Z
+    shm_size: 256m
+    networks:
+      - alfred-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  temporal:
+    image: docker.io/temporalio/auto-setup:latest
+    container_name: alfred-temporal
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=${TEMPORAL_DB_PASSWORD}
+      - POSTGRES_SEEDS=db
+    networks:
+      - alfred-net
+    ports:
+      - "7234:7233" # matches temporal.host: "localhost:7234" in config.yaml
+    restart: unless-stopped
+
+  temporal-ui:
+    image: docker.io/temporalio/ui:latest
+    container_name: alfred-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=alfred-temporal:7233
+    networks:
+      - alfred-net
+    ports:
+      - "8234:8080"
+    restart: unless-stopped
+
+networks:
+  alfred-net:
+    external: true

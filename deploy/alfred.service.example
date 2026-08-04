@@ -1,0 +1,35 @@
+# deploy/alfred.service.example
+#
+# Native-binary deployment: runs Alfred as a plain systemd-supervised
+# process instead of a container (see deploy/README.md, "Native binary +
+# separate Temporal stack"). Requires alfred-temporal-stack.service.example
+# (or an equivalent externally-managed Temporal stack) to be reachable at
+# the temporal.host configured in config.yaml before Alfred can start.
+#
+# Install as a user unit (adjust paths, then):
+#   cp deploy/alfred.service.example ~/.config/systemd/user/alfred.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now alfred.service
+#
+# Or as a system unit under /etc/systemd/system/ with an added User=/Group=.
+
+[Unit]
+Description=Alfred - Agentic AI Platform
+After=network-online.target alfred-temporal-stack.service
+Wants=network-online.target
+Requires=alfred-temporal-stack.service
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/alfred/config
+ExecStart=/path/to/alfred/bin/alfred --config /path/to/alfred/config/config.yaml --workflows /path/to/alfred/config/workflows
+Restart=on-failure
+RestartSec=5
+
+# Vertex AI: uses Application Default Credentials by default (unset if
+# credentials_file is configured in config.yaml, or if using llm_provider:
+# openrouter instead).
+Environment=HOME=/path/to/home
+
+[Install]
+WantedBy=default.target

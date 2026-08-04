@@ -1,0 +1,77 @@
+# Sandbox proving ground for the supervised engine (Level 0 Queue Monitor ->
+# Level 1 Case Supervisor). The supervisor reads one imaginary GitHub issue per
+# case in a disposable public repo, does the simple ask, comments the answer,
+# and labels the issue. Milestone 1: declared tools only, no sub-agents. Fully
+# disposable; never touches production trackers.
+#
+# The deployment provides host helper scripts on PATH (~/bin):
+#   sandbox-issue-prefilter --candidates   (candidate emitter)
+#   sandbox-issue-comment <n> -- <body>
+#   sandbox-issue-label <n> -- <label>
+#   sandbox-weather -- <city>
+# all acting as the bot via GH_TOKEN read from the host credential file.
+name: sandbox-issue-triage
+strategy: queue_monitor
+description: Sandbox proving ground - triage imaginary issues in a disposable public repo
+
+# Low-frequency safety net only. The Schedule is kept PAUSED after registration
+# and driven manually via POST /api/v1/agent-tasks/sandbox-issue-triage/run.
+schedule:
+  cron: "0 6 * * *"
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+prefilter:
+  type: command
+  command: sandbox-issue-prefilter --candidates
+
+monitor:
+  max_parallel_cases: 4
+  max_new_cases_per_pass: 5
+  max_case_attempts: 2
+
+supervisor:
+  # Paid gpt-oss-120b endpoint (not the :free tier, which is rate-limited
+  # upstream and returns HTTP 429 under any real load). Very cheap; the loop is
+  # additionally bounded by max_rounds and max_duration below.
+  model: openai/gpt-oss-120b
+  prompt:
+    base: prompts/agents/sandbox-issue-supervisor.md
+  max_rounds: 6
+  cost_cap_usd: 1.00
+  max_duration: 15m
+
+  tools:
+    - name: get_weather
+      description: Get the current weather for a city. Returns a one-line summary.
+      idempotent: true
+      command: ["sandbox-weather", "--", "{city}"]
+      args_schema:
+        type: object
+        required: [city]
+        properties:
+          city: { type: string, description: "City name, for example Helsinki." }
+    - name: comment_on_issue
+      description: Post a comment on the sandbox repo issue for this case.
+      idempotent: false
+      command: ["sandbox-issue-comment", "{number}", "--", "{body}"]
+      args_schema:
+        type: object
+        required: [number, body]
+        properties:
+          number: { type: integer, description: "The issue number for this case." }
+          body: { type: string, description: "Markdown comment body." }
+    - name: label_issue
+      description: Add a label to the sandbox repo issue for this case.
+      idempotent: true
+      command: ["sandbox-issue-label", "{number}", "--", "{label}"]
+      args_schema:
+        type: object
+        required: [number, label]
+        properties:
+          number: { type: integer, description: "The issue number for this case." }
+          label: { type: string, description: "One of: question, task, needs-info, alfred-handled." }
+
+cleanup: []

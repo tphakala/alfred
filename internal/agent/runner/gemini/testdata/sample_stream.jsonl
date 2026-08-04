@@ -1,0 +1,6 @@
+{"type":"system","subtype":"start","session_id":"s-1","model":"gemini-3.1-pro-preview","tools":["Read","Grep"]}
+{"type":"text_delta","text":"Hello"}
+{"type":"text_delta","text":" world"}
+{"type":"tool_call","id":"call-1","name":"Read","input":{"path":"/tmp/foo"}}
+{"type":"tool_result","tool_call_id":"call-1","content":"file contents"}
+{"type":"result","is_error":false,"usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150},"total_cost_usd":0.0012}

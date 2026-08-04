@@ -1,0 +1,40 @@
+# Binaries
+bin/
+/alfred
+*.exe
+
+
+# Config with secrets
+config.yaml
+!config.yaml.example
+.env
+
+# Encrypted secrets store
+secrets.enc.json
+secrets.enc.json.tmp
+secrets.enc.json.bak
+secrets.enc.json.lock
+*.key
+
+# Credentials
+*.json
+!deploy/*.json
+!internal/workflow/testdata/*_history.json
+
+# Go
+vendor/
+
+# Worktrees
+.worktrees/
+
+# Task runner state
+.task/
+
+
+# Tool-generated local state (Serena LSP index, CodeGraph index)
+.serena/
+.codegraph/
+
+# Private design docs (plans, specs, research, session notes): local only, never published
+docs/superpowers/
+docs/research/

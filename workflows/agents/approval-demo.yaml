@@ -1,0 +1,26 @@
+name: approval-demo
+strategy: external_agent
+runner: claude
+description: Demonstrates Tier 2 per-call approval via MCP permission bridge
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+phases:
+  - name: main
+    model: claude-sonnet-4-6
+    prompt:
+      base: prompts/agents/approval-demo.md
+    tools:
+      bash: ["ls*", "cat*"]
+      builtin: [Read, Grep]
+    runner_flags:
+      max_turns: 20
+      max_budget_usd: 1.00
+    steering:
+      mode: interactive
+    output:
+      capture: text
+
+cleanup: []

@@ -1,0 +1,39 @@
+name: ticket-triage
+description: Classify and route new tickets
+trigger:
+  type: polling
+  entity: Ticket
+  filter:
+    status: New
+  interval: 5m
+model: gemini-3-flash-preview
+approval: none
+memory:
+  bank: alfred-tickets
+  recall_before: true
+  retain_after: true
+steps:
+  - analyze:
+      prompt: |
+        Analyze this Autotask ticket and determine:
+        - Category (network, server, application, security, other)
+        - Priority (critical, high, medium, low)
+        - Suggested queue/resource
+        Ticket title: {{ .Title }}
+        Ticket description: {{ .Description }}
+      output_schema:
+        category:
+          type: string
+          enum: [network, server, application, security, other]
+        priority:
+          type: string
+          enum: [critical, high, medium, low]
+        suggested_queue:
+          type: string
+        reasoning:
+          type: string
+  - act:
+      - set_field: { name: category, value: "{{ .category }}" }
+      - set_field: { name: priority, value: "{{ .priority }}" }
+      - assign_queue: "{{ .suggested_queue }}"
+      - add_note: "Auto-triaged by Alfred: {{ .reasoning }}"

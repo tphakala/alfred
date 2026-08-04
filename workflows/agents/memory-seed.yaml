@@ -1,0 +1,54 @@
+name: memory-seed
+strategy: external_agent
+runner: claude
+description: Seed the birdnet-go-support Hindsight bank with curated facts from merged PRs and discussions. Manual trigger only.
+
+schedule:
+  cron: ""
+  randomized_delay: 0s
+  persistent: false
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+budgets:
+  workflow_max_cost_usd: 5.00
+  workflow_max_wall_clock: 15m
+
+preflight: []
+
+prefilter:
+  type: command
+  command: |
+    printf '{"proceed":true,"data":{}}'
+
+phases:
+  - name: main
+    model: claude-sonnet-4-6
+    runner_flags:
+      max_turns: 30
+      max_budget_usd: 3.0
+    prompt:
+      base: agents/memory-seed.md
+    tools:
+      bash:
+        - "date*"
+        - "gh pr list*"
+        - "gh pr view*"
+        - "gh api*"
+      builtin: [Read, Grep, Glob]
+      mcp:
+        servers:
+          hindsight-memory-birdnet-go-support:
+            type: http
+            url: http://localhost:8890/mcp/birdnet-go-support/
+    steering:
+      mode: scheduled
+    output:
+      capture: text
+
+state:
+  bank: birdnet-go-support
+
+cleanup: []

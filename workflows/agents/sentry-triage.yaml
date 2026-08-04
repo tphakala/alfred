@@ -1,0 +1,46 @@
+# Manually triggered only (no schedule.cron). Run via POST /api/agent-tasks/sentry-triage/run.
+name: sentry-triage
+strategy: external_agent
+runner: claude
+description: Triage new and unresolved Sentry issues for tphakala/birdnet-go
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+prefilter:
+  type: command
+  command: ~/bin/sentry-triage-prefilter
+
+phases:
+  - name: main
+    model: claude-opus-4-6
+    runner_flags:
+      max_turns: 40
+      max_budget_usd: 3.00
+    prompt:
+      base: prompts/agents/sentry-triage.md
+      includes:
+        - prompts/agents/_voice.md
+    tools:
+      bash:
+        - "github-issues comment*"
+        - "github-issues close*"
+        - "github-issues label*"
+        - "sentry issue list birdnet-go/birdnet-go*"
+        - "sentry issue view*"
+      builtin: [Read, Grep, Glob, WebFetch]
+      mcp:
+        servers:
+          hindsight-memory-birdnet-go-support:
+            type: http
+            url: http://localhost:8890/mcp/birdnet-go-support/
+          forgejo-bot:
+            type: http
+            url: https://forgejo-mcp-bot.koti/mcp
+    steering:
+      mode: scheduled
+    output:
+      capture: text
+
+cleanup: []

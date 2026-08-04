@@ -1,0 +1,919 @@
+openapi: 3.1.0
+info:
+  title: Alfred API
+  version: "1.0.0"
+  description: |
+    Resource-oriented REST API for the Alfred agentic platform. This document is
+    the single source of truth for the headless backend and the separate Svelte
+    client. Generate a typed client with
+    `openapi-typescript api/openapi.yaml -o src/lib/api/types.ts`, or fetch the
+    served copy at `GET /api/v1/openapi.json` (unauthenticated). A narrative
+    integration guide with code samples lives at `api/README.md`.
+
+    ## Base URL and versioning
+
+    Every path below is served under `/api/v1`. The unversioned ops endpoints
+    `GET /healthz` (liveness) and `GET /readyz` (readiness) live outside this
+    contract and outside `/api/v1`; see `deploy/README.md`.
+
+    ## Authentication
+
+    Send `Authorization: Bearer <api key>` on every request. Call
+    `GET /auth-info` (unauthenticated) first: when it returns
+    `{"required": false}` the server was started without an API key and accepts
+    requests without the header. Browsers cannot set an Authorization header on
+    `EventSource`, so for SSE you mint a short-lived single-use ticket with
+    `POST /auth/sse-tickets` and pass it as the `?ticket=` query parameter.
+
+    ## Errors
+
+    Every error is RFC 9457 `application/problem+json` with at least `title` and
+    `status`. `401` is a missing or wrong bearer token (or a spent/expired SSE
+    ticket). `404` is an unknown run, config, or task. `409` means the action is
+    not valid for that run's strategy (gate on `Run.supportedActions`). `412` is
+    an `If-Match` etag precondition failure on a workflow-config write.
+
+    ## Pagination
+
+    List endpoints accept `pageSize` (1 to 200, default 50) and an opaque
+    `pageToken`, and return `{ items, nextPageToken }`. Pass the returned
+    `nextPageToken` back to fetch the next page; stop when it is absent.
+
+    ## Runs and capabilities
+
+    A run is one execution (a chat session, a ticket triage, or an
+    external/fanout agent task), addressed by its stable `sessions.id` UUID. That
+    id is stable across Temporal `ContinueAsNew` epoch transitions, so it is safe
+    to hold in the UI for the life of a conversation. `Run.strategy` selects the
+    behavior (`react` chat, `step_dag` ticket, `fanout`/`monitor` agent), and
+    `Run.supportedActions` lists which sub-resources are valid for that run. Gate
+    UI affordances on `supportedActions` and expect a `409` problem if you call
+    an unsupported action. The action vocabulary is: `messages`,
+    `messages/retry`, `events`, `approvals`, `cancel`, `terminate`, `signal`,
+    `guidance`, `policy`, `children`.
+
+    ## Server-sent events
+
+    Three `text/event-stream` surfaces:
+
+    - `POST /runs/{run}/messages` streams one interactive turn inline. Its frames
+      carry `event:` and `data:` only (no `id:`), so this stream is not
+      resumable; a dropped connection means re-sending the turn.
+    - `GET /runs/{run}/events` is the resumable per-run stream.
+    - `GET /events` is the resumable global firehose across all runs.
+
+    Frames on the two resumable streams are prefixed `id: <sequence>` where
+    `sequence` is the persisted `messages.sequence`. On reconnect the browser
+    sends the last id back in the `Last-Event-ID` header (you can also set it
+    manually with `fetch`), and the server replays events after that sequence, so
+    resume neither loses nor duplicates events across epoch transitions. The
+    per-event-type `data` shapes are documented on the `EventStream` schema.
+servers:
+  - url: /api/v1
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    PageToken:
+      name: pageToken
+      in: query
+      schema: { type: string }
+    RunId:
+      name: run
+      in: path
+      required: true
+      description: The stable sessions.id UUID for the run.
+      schema: { type: string, format: uuid }
+    ConfigName:
+      name: name
+      in: path
+      required: true
+      description: The workflow-config name.
+      schema: { type: string }
+    AgentTaskName:
+      name: name
+      in: path
+      required: true
+      description: The agent-task name.
+      schema: { type: string }
+    TaskId:
+      name: task
+      in: path
+      required: true
+      description: The task_state ledger's task name (an AgentConfig name).
+      schema: { type: string }
+    CandidateKey:
+      name: key
+      in: path
+      required: true
+      description: The task_state ledger's candidate_key.
+      schema: { type: string }
+    CallId:
+      name: callId
+      in: path
+      required: true
+      description: The tool call id of the pending approval.
+      schema: { type: string }
+    SSETicket:
+      name: ticket
+      in: query
+      description: A short-lived single-use SSE ticket minted by POST /auth/sse-tickets.
+      schema: { type: string }
+      x-go-name: SSETicketParam
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      description: Resume token; the server replays events after this sequence id.
+      schema: { type: string }
+  schemas:
+    Problem:
+      type: object
+      description: An RFC 9457 problem document, served as application/problem+json.
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+      required: [title, status]
+      example:
+        title: run not found
+        status: 404
+    Run:
+      type: object
+      description: One execution, addressed by its stable sessions.id UUID.
+      properties:
+        id: { type: string, format: uuid, description: "Stable run id (sessions.id); stable across epoch ContinueAsNew." }
+        agent: { type: string, description: "Agent-task name for external/fanout runs; empty for chat and ticket runs." }
+        strategy: { type: string, enum: [react, step_dag, fanout, monitor], description: "react = chat, step_dag = ticket triage, fanout/monitor = external agent." }
+        kind: { type: string, description: "Underlying session kind: chat, ticket, or monitor." }
+        status: { type: string, description: "active, completed, or continued." }
+        epoch: { type: integer, description: "Epoch counter; increments on each ContinueAsNew context rollover." }
+        parent: { type: string, description: "Parent run id for fanout child runs; empty otherwise." }
+        supportedActions:
+          type: array
+          items: { type: string }
+          description: "Sub-resources valid for this run. Gate UI on this; unsupported actions return 409. One or more of: messages, messages/retry, events, approvals, cancel, terminate, signal, guidance, policy, children."
+        createTime: { type: string, format: date-time }
+        updateTime: { type: string, format: date-time }
+      required: [id, strategy, kind, status]
+      example:
+        id: "b3f1c2a4-5d6e-4f80-9a1b-2c3d4e5f6071"
+        strategy: react
+        kind: chat
+        status: active
+        epoch: 1
+        supportedActions: [messages, "messages/retry", events, approvals]
+        createTime: "2026-06-06T12:00:00Z"
+        updateTime: "2026-06-06T12:01:30Z"
+    RunList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Run' } }
+        nextPageToken: { type: string }
+      required: [items]
+    CreateRunRequest:
+      type: object
+      properties:
+        agent: { type: string }
+        strategy: { type: string, enum: [react, step_dag, fanout, monitor] }
+        params: { type: object, additionalProperties: true }
+    SignalRequest:
+      type: object
+      properties:
+        name: { type: string }
+        input: { type: object, additionalProperties: true }
+      required: [name]
+    Message:
+      type: object
+      properties:
+        id: { type: string }
+        role: { type: string, description: "One of: user, model, tool_call, tool_result, context, approval_request, approval_result (matches the messages.role CHECK constraint)." }
+        content: { type: string }
+        sequence: { type: integer, description: "Monotonic per-run sequence; also the SSE resume id on the per-run events stream." }
+        createTime: { type: string, format: date-time }
+      required: [id, role]
+      example:
+        id: "f7c0e2d1-3a4b-4c5d-8e9f-0a1b2c3d4e5f"
+        role: model
+        content: "I have triaged the ticket and added a note."
+        sequence: 12
+        createTime: "2026-06-06T12:01:25Z"
+    MessageList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        nextPageToken: { type: string }
+      required: [items]
+    SendMessageRequest:
+      type: object
+      properties:
+        content: { type: string }
+      required: [content]
+    Approval:
+      type: object
+      description: A pending tool-call approval awaiting a human decision.
+      properties:
+        callId: { type: string, description: "The tool call id; pass it to /approvals/{callId}/resolve." }
+        toolName: { type: string }
+        input: { type: object, additionalProperties: true }
+        createTime: { type: string, format: date-time }
+      required: [callId]
+      example:
+        callId: "t2-c0"
+        toolName: request_approval
+        input: { action: "set_field", description: "Set queue to Tier 2" }
+        createTime: "2026-06-06T12:01:20Z"
+    ApprovalList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Approval' } }
+        nextPageToken: { type: string }
+      required: [items]
+    ResolveApprovalRequest:
+      type: object
+      properties:
+        approved: { type: boolean }
+        reason: { type: string }
+      required: [approved]
+    GuidanceRequest:
+      type: object
+      properties:
+        text: { type: string }
+      required: [text]
+    ApprovalPolicy:
+      type: object
+      description: Session approval policy for a fanout run.
+      properties:
+        autoApproveAll: { type: boolean }
+        autoApproveTools:
+          type: object
+          additionalProperties: { type: boolean }
+        denyTools:
+          type: object
+          additionalProperties: { type: boolean }
+    ApprovalPolicyDelta:
+      type: object
+      description: Additive change to a session approval policy.
+      properties:
+        addTools:
+          type: array
+          items: { type: string }
+    WorkflowConfig:
+      type: object
+      properties:
+        name: { type: string }
+        etag: { type: string }
+        content: { type: string }
+      required: [name]
+    WorkflowConfigList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/WorkflowConfig' } }
+        nextPageToken: { type: string }
+      required: [items]
+    AgentTask:
+      type: object
+      properties:
+        name: { type: string }
+        schedule: { type: string }
+        runner: { type: string }
+        strategy: { type: string }
+      required: [name]
+    AgentTaskList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AgentTask' } }
+        nextPageToken: { type: string }
+      required: [items]
+    TaskStateItem:
+      type: object
+      description: |
+        One row in the task_state ledger: the durable cross-run record of which
+        candidates a task has handled and their outcome. task and candidateKey
+        are opaque strings the deployment defines; outcome is opaque JSON the
+        engine never interprets.
+      properties:
+        task: { type: string, description: "The AgentConfig (task) name." }
+        candidateKey: { type: string, description: "Deployment-defined dedup identity for a work item (e.g. an external record id)." }
+        status: { type: string, description: "One of: in_progress, done, skipped, escalated, needs_attention." }
+        outcome:
+          description: "Arbitrary structured result recorded by the supervisor, passed through untouched. Any valid JSON value: an object, array, string, number, boolean, or null."
+          x-go-type: json.RawMessage
+        caseRunId: { type: string, description: "Temporal run id of the Case workflow that claimed this candidate." }
+        attempts: { type: integer, description: "Case start count; guards infinite re-dispatch of failing candidates." }
+        createTime: { type: string, format: date-time }
+        updateTime: { type: string, format: date-time }
+      required: [task, candidateKey, status]
+      example:
+        task: "example-task"
+        candidateKey: "record-1"
+        status: done
+        outcome: { result: "ok" }
+        caseRunId: "b3f1c2a4-5d6e-4f80-9a1b-2c3d4e5f6071"
+        attempts: 1
+        createTime: "2026-07-08T12:00:00Z"
+        updateTime: "2026-07-08T12:05:00Z"
+    TaskStateList:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/TaskStateItem' } }
+        nextPageToken: { type: string }
+      required: [items]
+    Poller:
+      type: object
+      description: Autotask ticket poller state.
+      properties:
+        lastPolled: { type: string, format: date-time }
+        seenCount: { type: integer }
+        workflowCount: { type: integer }
+    SSETicket:
+      type: object
+      description: A short-lived single-use SSE ticket. Pass it once as ?ticket= on an SSE stream.
+      properties:
+        ticket: { type: string }
+        expiresAt: { type: string, format: date-time }
+      required: [ticket, expiresAt]
+      example:
+        ticket: "tF4kq1m9oQ8rZ2sB7n0wXy"
+        expiresAt: "2026-06-06T12:00:30Z"
+    AuthInfo:
+      type: object
+      description: Whether the server requires a bearer API key.
+      properties:
+        required: { type: boolean }
+      required: [required]
+      example:
+        required: true
+    EventStream:
+      type: string
+      description: |
+        A `text/event-stream`. Each frame is an `event: <type>` line plus a
+        `data: <json>` line; the two resumable streams (`GET /events`,
+        `GET /runs/{run}/events`) also prefix `id: <sequence>`. Parse `data` as
+        JSON; its shape depends on the event type:
+
+        | event | data fields | meaning |
+        | --- | --- | --- |
+        | `chunk` | `turnId`, `text` | a streamed slice of model text; append in arrival order |
+        | `tool_call` | `callId`, `turnId`, `name`, `args` | the agent invoked a tool |
+        | `tool_result` | `callId`, `turnId`, `name`, `result` | a tool call returned |
+        | `approval_request` | `callId`, `turnId`, `name`, `action`, `description` | the run paused for human approval; resolve via `POST /runs/{run}/approvals/{callId}/resolve` |
+        | `usage` | `total` | cumulative token usage for the turn |
+        | `done` | `turnId` | the turn finished; terminal frame of a message turn |
+        | `error` | `message` | the turn ended abnormally |
+        | `message` | the persisted message record | the per-run stream backfills history (one frame per stored message) on connect and resume |
+        | `agent_event` | runner-specific | a normalized event from an external-agent (fanout) run |
+        | `guidance_received` | runner-specific | mid-run operator guidance was applied |
+
+        A chat turn typically streams `chunk`* then optional
+        `tool_call`/`tool_result` pairs, an optional `usage`, and a final `done`.
+        When the agent needs approval you get an `approval_request` followed by
+        `done`; resolve the approval, then start the next turn.
+security:
+  - bearerAuth: []
+paths:
+  /auth-info:
+    get:
+      operationId: getAuthInfo
+      security: []
+      responses:
+        "200":
+          description: whether an API key is required
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthInfo' }
+  /openapi.json:
+    get:
+      operationId: getOpenAPISpec
+      security: []
+      description: This OpenAPI 3.1 contract as JSON. Unauthenticated; the root index advertises it.
+      responses:
+        "200":
+          description: the OpenAPI document
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+  /auth/sse-tickets:
+    post:
+      operationId: createSSETicket
+      responses:
+        "201":
+          description: a short-lived single-use SSE ticket
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSETicket' }
+        "401":
+          description: unauthorized
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs:
+    get:
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+        - { name: strategy, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: kind, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: a page of runs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunList' }
+    post:
+      operationId: createRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRunRequest' }
+      responses:
+        "201":
+          description: the created run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        "400":
+          description: invalid request
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}:
+    get:
+      operationId: getRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        "200":
+          description: the run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      operationId: deleteRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        "204":
+          description: the run was deleted or closed
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/cancel:
+    post:
+      operationId: cancelRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        "200":
+          description: the run after cancellation was requested
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: cancel is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/terminate:
+    post:
+      operationId: terminateRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        "200":
+          description: the run after termination was requested
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: terminate is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/signal:
+    post:
+      operationId: signalRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignalRequest' }
+      responses:
+        "202":
+          description: the signal was accepted
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: signal is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/messages:
+    get:
+      operationId: listRunMessages
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        "200":
+          description: a page of messages
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageList' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    post:
+      operationId: sendRunMessage
+      description: Send an interactive turn. The response is streamed as text/event-stream.
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        "200":
+          description: the streamed turn response
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/EventStream' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: sending a message is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/messages/retry:
+    post:
+      operationId: retryRunMessage
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        "202":
+          description: the retry was accepted
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: retry is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/events:
+    get:
+      operationId: getRunEvents
+      description: SSE stream of run events. Resumable via Last-Event-ID. Authenticated by bearer header or a short-lived ticket query parameter.
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/SSETicket'
+        - $ref: '#/components/parameters/LastEventId'
+      responses:
+        "200":
+          description: the SSE stream of run events
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/EventStream' }
+        "401":
+          description: unauthorized
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/approvals:
+    get:
+      operationId: listRunApprovals
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        "200":
+          description: a page of pending approvals
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalList' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/approvals/{callId}/resolve:
+    post:
+      operationId: resolveRunApproval
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveApprovalRequest' }
+      responses:
+        "204":
+          description: the approval was resolved
+        "404":
+          description: run or approval not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: resolving approvals is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/guidance:
+    post:
+      operationId: sendRunGuidance
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GuidanceRequest' }
+      responses:
+        "202":
+          description: the guidance was accepted
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: guidance is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/policy:
+    put:
+      operationId: setRunPolicy
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalPolicy' }
+      responses:
+        "200":
+          description: the updated approval policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalPolicy' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: setting a policy is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    patch:
+      operationId: extendRunPolicy
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApprovalPolicyDelta' }
+      responses:
+        "200":
+          description: the extended approval policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalPolicy' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        "409":
+          description: extending a policy is not a supported action for this run
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /runs/{run}/children:
+    get:
+      operationId: listRunChildren
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        "200":
+          description: a page of fanout child runs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunList' }
+        "404":
+          description: run not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /workflow-configs:
+    get:
+      operationId: listWorkflowConfigs
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        "200":
+          description: a page of workflow configs
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowConfigList' }
+  /workflow-configs/{name}:
+    get:
+      operationId: getWorkflowConfig
+      parameters:
+        - $ref: '#/components/parameters/ConfigName'
+      responses:
+        "200":
+          description: the workflow config (carries an etag)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowConfig' }
+        "404":
+          description: workflow config not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    put:
+      operationId: putWorkflowConfig
+      parameters:
+        - $ref: '#/components/parameters/ConfigName'
+        - name: If-Match
+          in: header
+          description: The expected etag for optimistic concurrency.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowConfig' }
+      responses:
+        "200":
+          description: the upserted workflow config (created when absent)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowConfig' }
+        "412":
+          description: etag precondition failed
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /agent-tasks:
+    get:
+      operationId: listAgentTasks
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        "200":
+          description: a page of agent tasks
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentTaskList' }
+  /agent-tasks/{name}:
+    get:
+      operationId: getAgentTask
+      parameters:
+        - $ref: '#/components/parameters/AgentTaskName'
+      responses:
+        "200":
+          description: the agent task
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentTask' }
+        "404":
+          description: agent task not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /agent-tasks/{name}/run:
+    post:
+      operationId: runAgentTask
+      parameters:
+        - $ref: '#/components/parameters/AgentTaskName'
+      responses:
+        "201":
+          description: the created run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        "404":
+          description: agent task not found
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /agent-tasks/{task}/state:
+    get:
+      operationId: listTaskState
+      description: A page of the task_state ledger for the given task, newest updated first.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+        - { name: status, in: query, description: "Filter by status: in_progress, done, skipped, escalated, or needs_attention.", schema: { type: string } }
+      responses:
+        "200":
+          description: a page of task_state ledger rows
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskStateList' }
+  /agent-tasks/{task}/state/{key}/requeue:
+    post:
+      operationId: requeueTaskState
+      description: |
+        Clears the ledger row for this candidate so the next monitor pass
+        treats it as new and re-dispatches it. The explicit human action for
+        returning a needs_attention (or done/skipped, for a forced redo)
+        candidate to the queue.
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/CandidateKey'
+      responses:
+        "204":
+          description: the candidate was requeued
+        "404":
+          description: no ledger row for this task and key
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /poller:
+    get:
+      operationId: getPoller
+      responses:
+        "200":
+          description: the poller state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Poller' }
+  /events:
+    get:
+      operationId: getEvents
+      description: Global SSE firehose. Resumable via Last-Event-ID. Authenticated by bearer header or a short-lived ticket query parameter.
+      parameters:
+        - $ref: '#/components/parameters/SSETicket'
+        - $ref: '#/components/parameters/LastEventId'
+      responses:
+        "200":
+          description: the global SSE firehose stream
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/EventStream' }
+        "401":
+          description: unauthorized
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }

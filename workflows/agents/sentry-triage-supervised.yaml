@@ -1,0 +1,145 @@
+# Proving-ground config for the three-level supervised shape (monitor ->
+# case supervisor -> cli sub-agent). Reshapes the read-mostly sentry-triage
+# task from the single-phase external_agent form (see sentry-triage.yaml,
+# left untouched as the pre-migration reference) into a queue_monitor task
+# with a Case Supervisor.
+#
+# Primarily manually triggered, same as sentry-triage.yaml, via
+# POST /api/v1/agent-tasks/sentry-triage-supervised/run (which calls the
+# Temporal Schedule's trigger-now action for a queue_monitor task, see
+# handleTriggerQueueMonitorV1). Unlike an external_agent task, queue_monitor
+# requires schedule.cron to be set (agentcfg.Validate rejects an empty one)
+# because the trigger-now path needs a Schedule to already exist. The daily
+# cadence below is a low-frequency safety net, not the primary way this runs.
+name: sentry-triage-supervised
+strategy: queue_monitor
+description: Triage new and unresolved Sentry issues for tphakala/birdnet-go (supervised, per-candidate)
+
+schedule:
+  cron: "0 7 * * *"
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+# The deployment must provide a candidate-emitter form of the prefilter: the
+# existing ~/bin/sentry-triage-prefilter returns the old proceed/data gate,
+# so a supervised task needs a new mode (--candidates here, adjust to the
+# real flag the deployment implements) that groups unresolved Sentry issues
+# by root cause and emits one candidate per group:
+#
+#   {"candidates": [
+#     {"key": "BIRDNET-GO-9W", "context": {
+#        "sentry_ids": ["BIRDNET-GO-9W", "BIRDNET-GO-Z4"],
+#        "title": "panic: nil pointer dereference in ...",
+#        "event_count": 42,
+#        "first_seen": "2026-06-01",
+#        "last_seen": "2026-07-07"
+#     }}
+#   ]}
+#
+# key is the group's primary Sentry short ID (stable dedup identity against
+# the task_state ledger); context is opaque to the engine and becomes the
+# case's first turn verbatim.
+prefilter:
+  type: command
+  command: ~/bin/sentry-triage-prefilter --candidates
+
+monitor:
+  max_parallel_cases: 3
+  max_new_cases_per_pass: 5
+  max_case_attempts: 3
+
+supervisor:
+  # Native provider model (Vertex/OpenRouter), not a CLI runner: the
+  # supervisor loop calls CaseLLMStream directly. Placeholder consistent
+  # with config.yaml.example's vertex_ai.model; pick the deployment's actual
+  # native model.
+  model: gemini-2.0-flash
+  prompt:
+    base: prompts/agents/sentry-triage-supervisor.md
+    includes:
+      - prompts/agents/_voice.md
+  max_rounds: 8
+  # cost_cap_usd meters the supervisor's own LLM token spend (priced per model
+  # from the built-in table, overridable via the top-level `pricing` config)
+  # plus any spawned sub-agent cost. A model absent from the pricing table
+  # contributes zero (logged once), so keep its pricing current.
+  cost_cap_usd: 3.00
+  max_duration: 30m
+
+  # The analysis sub-agent files to the internal tracker (mcp__forgejo-bot__
+  # create_issue, see sentry-triage-analysis.md), not GitHub, so the
+  # supervisor's own lightweight write-back tools target the same tracker
+  # via the forgejo-issues CLI rather than github-issues.
+  tools:
+    - name: comment_on_item
+      description: Post a comment on an already-tracked internal tracker issue that corresponds to this Sentry group.
+      idempotent: false
+      command: ["forgejo-issues", "comment", "{number}", "--", "{body}"]
+      args_schema:
+        type: object
+        required: [number, body]
+        properties:
+          number: { type: integer, description: "The internal tracker issue number." }
+          body: { type: string, description: "Markdown comment body." }
+    - name: label_item
+      description: Add a label to an already-tracked internal tracker issue that corresponds to this Sentry group.
+      idempotent: true
+      command: ["forgejo-issues", "label", "{number}", "--", "{label}"]
+      args_schema:
+        type: object
+        required: [number, label]
+        properties:
+          number: { type: integer, description: "The internal tracker issue number." }
+          label: { type: string, description: "Label to add." }
+
+  # One cli sub-agent kind: the deep dedup-and-file analysis the supervisor
+  # delegates to for a candidate it decides is worth a closer look. Same
+  # runner and tool/MCP surface as the pre-migration sentry-triage.yaml
+  # phase; its prompt is scoped to one candidate instead of the whole batch
+  # (see prompts/agents/sentry-triage-analysis.md).
+  sub_agents:
+    analysis:
+      runner: claude
+      phases:
+        - name: main
+          model: claude-opus-4-6
+          runner_flags:
+            max_turns: 30
+            max_budget_usd: 2.00
+          prompt:
+            base: prompts/agents/sentry-triage-analysis.md
+            includes:
+              - prompts/agents/_voice.md
+            header: |
+              Candidate input from the supervisor (the "input" argument passed to spawn_agent for this case): {{ .item }}
+          tools:
+            bash:
+              - "github-issues comment*"
+              - "github-issues close*"
+              - "github-issues label*"
+              - "sentry issue list birdnet-go/birdnet-go*"
+              - "sentry issue view*"
+            builtin: [Read, Grep, Glob, WebFetch]
+            # NOTE: a Case Supervisor sub-agent's MCP servers cannot currently
+            # receive hydrated ${secret:...} Headers/Env. The sub-agent's
+            # AgentConfig has no top-level name for hydrateMCPSecrets to match
+            # against, so such secrets are stripped from Temporal history and
+            # never restored. Keep this sub-agent's credentials (the
+            # forgejo-bot token, etc.) scoped to its helper binaries instead
+            # of MCP server Headers/Env until that gap is closed.
+            mcp:
+              servers:
+                hindsight-memory-birdnet-go-support:
+                  type: http
+                  url: http://localhost:8890/mcp/birdnet-go-support/
+                forgejo-bot:
+                  type: http
+                  url: https://forgejo-mcp-bot.koti/mcp
+          steering:
+            mode: scheduled
+          output:
+            capture: text
+
+cleanup: []

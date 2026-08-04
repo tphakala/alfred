@@ -1,0 +1,45 @@
+name: fanout-demo
+strategy: external_agent
+runner: claude
+description: Demonstrates fanout dispatch with a scout phase and per-item children
+
+concurrency:
+  max_concurrent: 1
+  on_conflict: skip
+
+phases:
+  - name: scout
+    model: claude-haiku-4-5
+    prompt:
+      base: prompts/agents/fanout-demo-scout.md
+    steering:
+      mode: scheduled
+    output:
+      capture: structured
+
+  - name: per_item
+    model: claude-sonnet-4-6
+    prompt:
+      base: prompts/agents/fanout-demo-child.md
+    steering:
+      mode: scheduled
+    output:
+      capture: text
+    fanout:
+      over: scout.items
+      max_parallel: 2
+      child:
+        model: claude-sonnet-4-6
+        prompt:
+          base: prompts/agents/fanout-demo-child.md
+          variables:
+            item_id: "{{ .item.id }}"
+        runner_flags:
+          max_turns: 10
+          max_budget_usd: 0.50
+        steering:
+          mode: scheduled
+        output:
+          capture: text
+
+cleanup: []

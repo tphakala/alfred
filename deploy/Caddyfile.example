@@ -1,0 +1,33 @@
+# deploy/Caddyfile.example
+#
+# Single-origin reverse-proxy deployment for Alfred. Caddy terminates TLS,
+# serves the (future) Svelte static build at /, and forwards the API and ops
+# endpoints to the headless Alfred backend. Because the browser app and the
+# API share one origin, no CORS configuration is needed: leave
+# server.cors.allowed_origins empty in config.yaml.
+
+alfred.example.com {
+	encode gzip
+
+	# API, ops, and discovery endpoints proxy to the headless Alfred backend.
+	# Adjust the upstream to wherever Alfred's server.address points
+	# (default :8080). Note: the sample deploy/docker-compose.yml maps
+	# temporal-ui to host port 8080, so if you co-locate the two, change one
+	# of the published ports to avoid a clash.
+	@backend path /api/* /healthz /readyz
+	handle @backend {
+		reverse_proxy localhost:8080
+	}
+
+	# Everything else is the static Svelte single-page app, served with a
+	# history-API fallback to index.html. Until that app ships this directory
+	# is empty and only the API above is useful (no dashboard in the interim).
+	handle {
+		root * /srv/alfred-ui
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# The internal POST /mcp/perm/{run_id} callback is a loopback between the agent
+# subprocess and the backend. Do not expose it through this public proxy.

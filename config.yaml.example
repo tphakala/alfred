@@ -1,0 +1,50 @@
+autotask:
+  api_url: "https://webservices.autotask.net/atservicesrest/v1.0"
+  username: "${secret:autotask.username}"
+  password: "${secret:autotask.password}"
+  integration_code: "${secret:autotask.integration_code}"
+
+temporal:
+  host: "localhost:7233"
+  namespace: "default"
+  task_queue: "alfred"
+
+vertex_ai:
+  project: "${GCP_PROJECT}"
+  location: "us-central1"
+  model: "gemini-2.0-flash"
+  credentials_file: "${secret:vertex_ai.credentials_file}"
+
+# llm_provider selects the LLM backend: "vertex" (default) or "openrouter"
+# llm_provider: "openrouter"
+
+# openrouter:
+#   api_key: "${secret:openrouter.api_key}"
+#   model: "anthropic/claude-sonnet-4-20250514"
+
+# pricing overrides/extends the built-in per-model token prices used to meter a
+# supervised loop's own LLM spend against cost_cap_usd. Values are USD per one
+# million tokens. Keys match by exact model id first, then by longest prefix, so
+# a versioned id (gemini-2.0-flash-001) resolves to a "gemini-2.0-flash" entry.
+# Only list models the built-in defaults miss or price wrong (e.g. an
+# OpenRouter-hosted model). An unlisted model's spend is not counted (logged).
+# Each listed model must set BOTH fields to a value > 0; a partial or zero
+# entry is rejected at startup (it would silently make token spend free).
+# pricing:
+#   "anthropic/claude-sonnet-4-20250514":
+#     input_per_million: 3.00
+#     output_per_million: 15.00
+
+hindsight:
+  url: "${secret:hindsight.url}"
+  bank: "alfred"
+
+logging:
+  level: "info"
+  format: "json"
+
+server:
+  address: ":8080"
+  api_key: "${secret:server.api_key}"
+  cors:
+    allowed_origins: []  # e.g. ["http://localhost:5173"] for separate-origin (Svelte dev) access

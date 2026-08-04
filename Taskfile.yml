@@ -1,0 +1,282 @@
+version: '3'
+
+vars:
+  BINARY_NAME: alfred
+  BUILD_DIR: ./bin
+  # Go 1.26 performance GOEXPERIMENT flags
+  # - jsonv2: Substantially faster JSON decoding
+  GO_EXPERIMENTS: jsonv2
+  # Linker flags for production builds (strip debug info)
+  LDFLAGS_PROD: -s -w
+
+env:
+  CGO_ENABLED: 0
+
+tasks:
+  # Development workflow
+  dev:
+    desc: "Run full development workflow (fmt, lint, test, build)"
+    cmds:
+      - task: clean:bin
+      - task: deps
+      - task: fmt
+      - task: lint
+      - task: test
+      - task: build
+
+  # Setup & Dependencies
+  setup:
+    desc: "Initial project setup"
+    cmds:
+      - task: deps
+      - task: tools
+      - echo "Setup complete"
+
+  deps:
+    desc: "Download and verify dependencies"
+    cmds:
+      - go mod download
+      - go mod verify
+      - go mod tidy
+
+  tools:
+    desc: "Install development tools"
+    cmds:
+      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+      - go install golang.org/x/tools/cmd/goimports@latest
+
+  # Code generation
+  gen:api:
+    desc: "Regenerate Go types from api/openapi.yaml"
+    cmds:
+      - GOEXPERIMENT={{.GO_EXPERIMENTS}} go generate ./internal/server/apiv1gen/...
+
+  # Code quality
+  fmt:
+    desc: "Format code"
+    cmds:
+      - gofmt -s -w .
+      - goimports -w .
+
+  lint:
+    desc: "Run linters"
+    deps: [fmt]
+    cmds:
+      - golangci-lint run --timeout=5m
+
+  lint:fix:
+    desc: "Run linters with auto-fix"
+    cmds:
+      - golangci-lint run --fix --timeout=5m
+
+  vet:
+    desc: "Run go vet"
+    cmds:
+      - go vet ./...
+
+  # Testing
+  test:
+    desc: "Run unit tests"
+    cmds:
+      - go test -v ./...
+
+  test:integration:
+    desc: "Run integration tests (requires Temporal)"
+    cmds:
+      - go test -tags integration -v ./...
+
+  test:coverage:
+    desc: "Run tests with coverage"
+    cmds:
+      - go test -v -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - echo "Coverage report generated at coverage.html"
+
+  test:race:
+    desc: "Run tests with race detection"
+    cmds:
+      - go test -race -v ./...
+
+  test:all:
+    desc: "Run all tests (unit + integration + race)"
+    cmds:
+      - task: test:race
+      - task: test:integration
+
+  # Building
+  build:
+    desc: "Build alfred binary"
+    deps: [clean:bin]
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -o {{.BUILD_DIR}}/{{.BINARY_NAME}} ./cmd/alfred
+      - echo "Built {{.BUILD_DIR}}/{{.BINARY_NAME}}"
+
+  build:prod:
+    desc: "Build optimized production binary (current platform)"
+    deps: [clean:bin]
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - |
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then
+          echo "Building optimized amd64 binary with GOAMD64=v3..."
+          GOAMD64=v3 GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -ldflags="{{.LDFLAGS_PROD}}" -o {{.BUILD_DIR}}/{{.BINARY_NAME}} ./cmd/alfred
+        elif [ "$ARCH" = "arm64" ]; then
+          echo "Building optimized arm64 binary with crypto extensions..."
+          GOARM64=v8.0,crypto GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -ldflags="{{.LDFLAGS_PROD}}" -o {{.BUILD_DIR}}/{{.BINARY_NAME}} ./cmd/alfred
+        else
+          echo "Building for $ARCH (no architecture-specific optimizations)..."
+          GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -ldflags="{{.LDFLAGS_PROD}}" -o {{.BUILD_DIR}}/{{.BINARY_NAME}} ./cmd/alfred
+        fi
+      - echo "Built optimized {{.BUILD_DIR}}/{{.BINARY_NAME}}"
+      - ls -lh {{.BUILD_DIR}}/{{.BINARY_NAME}}
+
+  build:debug:
+    desc: "Build binary with debug symbols"
+    deps: [clean:bin]
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -gcflags="all=-N -l" -o {{.BUILD_DIR}}/{{.BINARY_NAME}}-debug ./cmd/alfred
+      - echo "Built debug binary"
+
+  build:linux:
+    desc: "Build for Linux (uses Podman/Docker for cross-compilation from macOS)"
+    deps: [clean:bin]
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - |
+        if [ "$(uname)" = "Linux" ]; then
+          echo "Building natively on Linux..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -ldflags="{{.LDFLAGS_PROD}}" -o {{.BUILD_DIR}}/{{.BINARY_NAME}}-linux-amd64 ./cmd/alfred
+        else
+          if command -v podman >/dev/null 2>&1; then
+            CONTAINER_CMD="podman"
+          elif command -v docker >/dev/null 2>&1; then
+            CONTAINER_CMD="docker"
+          else
+            echo "Error: Neither podman nor docker found."
+            exit 1
+          fi
+          echo "Cross-compiling for Linux using $CONTAINER_CMD..."
+          $CONTAINER_CMD run --rm -v "$(pwd):/workspace" -w /workspace golang:1.26-alpine \
+            sh -c "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 GOEXPERIMENT={{.GO_EXPERIMENTS}} go build -ldflags='{{.LDFLAGS_PROD}}' -o {{.BUILD_DIR}}/{{.BINARY_NAME}}-linux-amd64 ./cmd/alfred"
+        fi
+      - echo "Built {{.BUILD_DIR}}/{{.BINARY_NAME}}-linux-amd64"
+
+  # Running
+  run:
+    desc: "Build and run alfred"
+    deps: [build]
+    cmds:
+      - "{{.BUILD_DIR}}/{{.BINARY_NAME}} -config config.yaml -workflows workflows {{.CLI_ARGS}}"
+
+  # Docker/Podman
+  docker:build:
+    desc: "Build Docker image"
+    cmds:
+      - podman build -t alfred -f deploy/Dockerfile .
+
+  docker:up:
+    desc: "Start Alfred stack (Alfred + Temporal + Postgres)"
+    dir: deploy
+    cmds:
+      - podman-compose up -d
+
+  docker:down:
+    desc: "Stop Alfred stack"
+    dir: deploy
+    cmds:
+      - podman-compose down
+
+  docker:logs:
+    desc: "Tail Alfred stack logs"
+    dir: deploy
+    cmds:
+      - podman-compose logs -f
+
+  # Database
+  db:up:
+    desc: "Start application database"
+    dir: deploy
+    cmds:
+      - podman-compose up -d alfred-db
+
+  db:down:
+    desc: "Stop application database"
+    dir: deploy
+    cmds:
+      - podman-compose stop alfred-db
+
+  # Temporal
+  temporal:start:
+    desc: "Start Temporal server only (for local dev)"
+    cmds:
+      - |
+        podman run -d --name temporal-dev \
+          -p 7233:7233 -p 8233:8233 \
+          temporalio/admin-tools:latest temporal server start-dev \
+          --ip 0.0.0.0 --db-filename /tmp/temporal.db
+      - echo "Temporal server started on localhost:7233, UI on localhost:8233"
+
+  temporal:stop:
+    desc: "Stop Temporal dev server"
+    cmds:
+      - podman stop temporal-dev && podman rm temporal-dev
+
+  # Installation
+  install:
+    desc: "Install optimized binary to GOPATH/bin"
+    cmds:
+      - |
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then
+          GOAMD64=v3 GOEXPERIMENT={{.GO_EXPERIMENTS}} go install -ldflags="{{.LDFLAGS_PROD}}" ./cmd/alfred
+        elif [ "$ARCH" = "arm64" ]; then
+          GOARM64=v8.0,crypto GOEXPERIMENT={{.GO_EXPERIMENTS}} go install -ldflags="{{.LDFLAGS_PROD}}" ./cmd/alfred
+        else
+          GOEXPERIMENT={{.GO_EXPERIMENTS}} go install -ldflags="{{.LDFLAGS_PROD}}" ./cmd/alfred
+        fi
+      - echo "Installed alfred to GOPATH/bin"
+
+  # Cleaning
+  clean:
+    desc: "Clean all build artifacts"
+    cmds:
+      - task: clean:bin
+      - task: clean:test
+
+  clean:bin:
+    desc: "Clean build directory"
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+
+  clean:test:
+    desc: "Clean test artifacts"
+    cmds:
+      - rm -f coverage.out coverage.html
+
+  # Release checks
+  release:check:
+    desc: "Run all checks before release"
+    cmds:
+      - task: clean
+      - task: deps
+      - task: fmt
+      - task: lint
+      - task: test:all
+      - task: build:prod
+      - echo "Release check passed"
+
+  # Utility
+  info:
+    desc: "Show project information"
+    cmds:
+      - 'echo "Project: {{.BINARY_NAME}}"'
+      - 'echo "Build dir: {{.BUILD_DIR}}"'
+      - 'echo "CGO: disabled"'
+      - 'echo "GOEXPERIMENT: {{.GO_EXPERIMENTS}}"'
+      - 'echo ""'
+      - 'echo "Architecture optimizations:"'
+      - 'echo "  amd64: GOAMD64=v3 (AVX2, FMA)"'
+      - 'echo "  arm64: GOARM64=v8.0,crypto"'

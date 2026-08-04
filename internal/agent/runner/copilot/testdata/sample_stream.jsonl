@@ -1,0 +1,6 @@
+{"type":"session_start","session_id":"s-1","model":"claude-sonnet-4-6"}
+{"type":"message_delta","delta":{"text":"hi"}}
+{"type":"tool_call","call_id":"c-1","tool":"Read","args":{"path":"/tmp/x"}}
+{"type":"tool_result","call_id":"c-1","result":"ok"}
+{"type":"some_undocumented_event","whatever":1}
+{"type":"complete","is_error":false,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}

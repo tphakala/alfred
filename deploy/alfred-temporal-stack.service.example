@@ -1,0 +1,34 @@
+# deploy/alfred-temporal-stack.service.example
+#
+# Wraps `podman compose` (or `docker compose`) for a small, dedicated
+# Temporal + Postgres stack in a systemd unit, so it survives reboots and
+# alfred.service.example can depend on it (see deploy/README.md, "Native
+# binary + separate Temporal stack"). This wraps a MULTI-container compose
+# stack (Type=oneshot + RemainAfterExit=yes), unlike a single `podman run`
+# quadlet unit.
+#
+# deploy/alfred-temporal-compose.yml.example is the reference compose file
+# (a dedicated Postgres, temporalio/auto-setup, temporalio/ui). Copy it to
+# compose.yml wherever WorkingDirectory below points.
+#
+# Install as a user unit (adjust paths, then):
+#   cp deploy/alfred-temporal-stack.service.example \
+#     ~/.config/systemd/user/alfred-temporal-stack.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now alfred-temporal-stack.service
+
+[Unit]
+Description=Alfred Temporal stack (db, temporal, temporal-ui) via compose
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/path/to/alfred-temporal-compose-dir
+ExecStart=/usr/bin/podman compose up -d
+ExecStop=/usr/bin/podman compose down
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

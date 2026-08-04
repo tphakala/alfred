@@ -1,0 +1,83 @@
+services:
+  alfred:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      temporal:
+        condition: service_healthy
+    volumes:
+      - ../config.yaml:/etc/alfred/config.yaml:ro
+      - ../workflows:/etc/alfred/workflows:ro
+      - ${GOOGLE_APPLICATION_CREDENTIALS}:/etc/gcp/credentials.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp/credentials.json
+      - AUTOTASK_API_URL
+      - AUTOTASK_USERNAME
+      - AUTOTASK_PASSWORD
+      - AUTOTASK_INTEGRATION_CODE
+      - GCP_PROJECT_ID
+      - GCP_LOCATION
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgres
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD", "tctl", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8080:8080"
+
+  temporal-postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+    volumes:
+      - temporal-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  alfred-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: alfred
+      POSTGRES_PASSWORD: alfred
+      POSTGRES_DB: alfred
+    ports:
+      - "5433:5432"
+    volumes:
+      - alfred-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alfred"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  temporal-pgdata:
+  alfred-pgdata:
