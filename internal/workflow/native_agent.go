@@ -35,6 +35,13 @@ const defaultNativeSystemInstruction = "You are a sub-agent. Complete the task d
 	"Call submit_result exactly once with your final output matching the declared schema, or " +
 	"report_failure with a concrete reason if the task cannot be completed."
 
+// nativeNoToolNudge is persisted as a user turn when a native sub-agent returns
+// a round with no tool calls, steering it back toward its terminal tools (see
+// runAgentLoop's no-progress guard, #26).
+const nativeNoToolNudge = "[system] Your previous turn called no tool. You must use a tool to make " +
+	"progress. Call submit_result with your final output when done, or report_failure with a " +
+	"concrete reason if the task cannot be completed."
+
 // NativeSubAgentWorkflow is a backend: native sub-agent: an autonomous LLM
 // ReAct loop on Alfred's native providers, spawned as a child of a Case
 // Supervisor. It reuses the shared runAgentLoop; its terminal tools are
@@ -167,6 +174,8 @@ func NativeSubAgentWorkflow(ctx workflow.Context, in NativeSubAgentInput) (Outco
 		MaxRounds:         maxRounds,
 		MaxDuration:       na.MaxDuration,
 		CostCapUSD:        na.CostCapUSD,
+		NudgeMessage:      nativeNoToolNudge,
+		IdempotencyPrefix: idemPrefix,
 		HandleTools:       handleNativeTools,
 	})
 	if err != nil {

@@ -192,9 +192,12 @@ func TestNativeSubAgentWorkflow_MaxRoundsFails(t *testing.T) {
 	env.OnActivity(acts.chatActs.PersistRound, mock.Anything, mock.Anything).Return(nil)
 	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(&BuildContextResult{}, nil)
-	// Never terminal: text-only rounds until max_rounds (3) exhausts.
+	// Never terminal, but each round calls a non-terminal (unknown) tool so it
+	// is NOT a no-tool-call round: a text-only round would now trip
+	// guardNoToolCalls after two nudges (#26). With a tool call every round the
+	// loop instead runs to max_rounds (3), preserving this test's intent.
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).Return(
-		&CaseLLMStreamResult{Text: "thinking"}, nil)
+		&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "noop-c0", Name: "noop"}}}, nil)
 
 	env.ExecuteWorkflow(NativeSubAgentWorkflow, NativeSubAgentInput{Config: nativeTestConfig(), Input: "go"})
 
@@ -204,6 +207,47 @@ func TestNativeSubAgentWorkflow_MaxRoundsFails(t *testing.T) {
 	require.NoError(t, env.GetWorkflowResult(&out))
 	assert.Equal(t, OutcomeStatusFailed, out.Status)
 	assert.Equal(t, guardMaxRounds, out.CancelReason)
+}
+
+// TestNativeSubAgentWorkflow_NoToolCallRounds_FinalizeFailed pins the #26 fix on
+// the native backend: consecutive no-tool-call rounds nudge (twice) then trip
+// guardNoToolCalls, mapping to a failed Outcome. The nudge assertions pin the
+// native NudgeMessage/IdempotencyPrefix wiring; without them the outcome alone
+// would pass on the generic guard mapping and drive no new native code.
+func TestNativeSubAgentWorkflow_NoToolCallRounds_FinalizeFailed(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	acts, extActs := registerNativeAgentActivities(env)
+
+	env.OnActivity(extActs.CreateAgentSession, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(&BuildContextResult{}, nil)
+	getPersists := capturePersistRounds(t, env, acts.chatActs.PersistRound)
+	var llmCalls int
+	// Every round empty; nativeTestConfig MaxRounds is 3, so the no_tool_calls
+	// trip on round 3 precedes any max_rounds exit.
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { llmCalls++ }).
+		Return(&CaseLLMStreamResult{}, nil)
+
+	env.ExecuteWorkflow(NativeSubAgentWorkflow, NativeSubAgentInput{Config: nativeTestConfig(), Input: "go"})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	var out Outcome
+	require.NoError(t, env.GetWorkflowResult(&out))
+	assert.Equal(t, OutcomeStatusFailed, out.Status)
+	assert.Equal(t, guardNoToolCalls, out.CancelReason)
+	assert.Equal(t, 1+maxNoToolCallNudges, llmCalls)
+
+	nudges := nudgePersists(getPersists())
+	require.Len(t, nudges, maxNoToolCallNudges)
+	for _, n := range nudges {
+		assert.True(t, strings.HasPrefix(n.IdempotencyKey, "agent-"), "native nudge key prefix agent-, got %q", n.IdempotencyKey)
+		require.Len(t, n.Messages, 1)
+		assert.Equal(t, ctxbuild.RoleUser, n.Messages[0].Role)
+		assert.Contains(t, n.Messages[0].Content, "submit_result")
+	}
 }
 
 func TestNativeSubAgentWorkflow_DeclaredToolRuns(t *testing.T) {

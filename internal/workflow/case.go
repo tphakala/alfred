@@ -69,6 +69,12 @@ const (
 	defaultSupervisorSystemInstruction = "You are the case supervisor. Work the task using the " +
 		"tools available to you, then call record_outcome with a terminal status once you have " +
 		"reached a conclusion."
+
+	// supervisorNoToolNudge is persisted as a user turn when the supervisor
+	// returns a round with no tool calls, steering it back toward record_outcome
+	// (see runAgentLoop's no-progress guard, #26).
+	supervisorNoToolNudge = "[system] Your previous turn called no tool. You must use a tool to " +
+		"make progress. When you have reached a conclusion, call record_outcome with a terminal status."
 )
 
 // CaseWorkflow is the Level 1 case supervisor: an autonomous LLM ReAct loop,
@@ -76,8 +82,8 @@ const (
 // tools the LLM called (spawning sub-agent children, running declared
 // commands), persists the round, and checks whether the LLM finalized the
 // case via record_outcome. Guards on wall-clock duration, cumulative cost,
-// and round count force the case to a needs_attention outcome if none of
-// them trip first.
+// round count, and consecutive no-tool-call rounds force the case to a
+// needs_attention outcome if none of them trip first.
 func CaseWorkflow(ctx workflow.Context, in CaseInput) (CaseOutcome, error) { //nolint:gocognit,gocyclo,gocritic // per-round orchestration is inherently complex, mirrors runAgentTurnV2; hugeParam: workflow inputs are value-semantic for Temporal serialization
 	sup := in.Config.Supervisor
 	maxRounds := sup.MaxRounds
@@ -179,6 +185,8 @@ func CaseWorkflow(ctx workflow.Context, in CaseInput) (CaseOutcome, error) { //n
 		MaxRounds:         maxRounds,
 		MaxDuration:       sup.MaxDuration,
 		CostCapUSD:        sup.CostCapUSD,
+		NudgeMessage:      supervisorNoToolNudge,
+		IdempotencyPrefix: idemPrefix,
 		HandleTools:       handleSupervisorTools,
 	})
 	if err != nil {
@@ -429,8 +437,8 @@ func finalizeCase(ctx workflow.Context, in CaseInput, status string, outcome jso
 }
 
 // finalizeNeedsAttention finalizes the case as needs_attention with reason
-// recorded in the outcome, for any of the three guard trips (max_duration,
-// cost_cap, max_rounds).
+// recorded in the outcome, for any guard trip that ends the loop without a
+// terminal tool (max_duration, cost_cap, max_rounds, no_tool_calls).
 func finalizeNeedsAttention(ctx workflow.Context, in CaseInput, reason string) (CaseOutcome, error) { //nolint:gocritic // hugeParam: workflow inputs are value-semantic for Temporal serialization
 	b, err := json.Marshal(map[string]string{"reason": reason})
 	if err != nil {

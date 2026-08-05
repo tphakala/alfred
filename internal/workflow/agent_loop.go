@@ -14,13 +14,25 @@ import (
 )
 
 // Guard-trip reasons returned by runAgentLoop when no terminal tool was
-// accepted. These are the exact strings CaseWorkflow has always recorded in
-// its needs_attention ledger outcome, now shared with the native loop.
+// accepted. The supervisor records these in its needs_attention ledger
+// outcome; the native loop maps them to a failed Outcome reason (cost_cap
+// maps to budget_exceeded). guardNoToolCalls was added in #26.
 const (
 	guardMaxRounds   = "max_rounds"
 	guardMaxDuration = "max_duration"
 	guardCostCap     = "cost_cap"
+	// guardNoToolCalls trips when the model returns maxNoToolCallNudges+1
+	// consecutive rounds with no tool calls: the loop nudges the model back
+	// toward its terminal tool a bounded number of times, then gives up rather
+	// than re-invoke the LLM on a model-side-last context (#26).
+	guardNoToolCalls = "no_tool_calls"
 )
+
+// maxNoToolCallNudges bounds how many consecutive no-tool-call rounds the loop
+// nudges (persists a synthetic user turn to force progress) before tripping
+// guardNoToolCalls. The trip happens on the (maxNoToolCallNudges+1)-th
+// consecutive no-tool-call round. Any round with a tool call resets the count.
+const maxNoToolCallNudges = 2
 
 // loopStop is HandleTools' signal that the loop should end after this round.
 // Terminal is the accepted terminal tool call (record_outcome for the
@@ -41,11 +53,26 @@ type agentLoopSpec struct {
 	MaxDuration       time.Duration
 	CostCapUSD        float64
 
+	// NudgeMessage is the user-side text runAgentLoop persists on a
+	// no-tool-call round to steer the model back to its terminal tool. It must
+	// name that terminal tool (record_outcome for the supervisor;
+	// submit_result/report_failure for a native sub-agent). Required: an empty
+	// value would persist an empty user turn (the store only short-circuits an
+	// empty message LIST, not an empty message).
+	NudgeMessage string
+	// IdempotencyPrefix is the loop's persist-key prefix ("case-<sid>" /
+	// "agent-<sid>"). It MUST match the prefix the caller's HandleTools closure
+	// persists under, so the nudge key ("<prefix>-<round>-nudge") shares the
+	// round's key namespace.
+	IdempotencyPrefix string
+
 	// HandleTools processes one round: it classifies the LLM's tool calls,
-	// runs the non-terminal ones, persists the round (it owns ALL round
-	// persistence, including the no-tool-call round and the accepted- or
-	// rejected-terminal call/result), and decides whether the round is
-	// terminal. It returns the cost incurred this round, a non-nil *loopStop
+	// runs the non-terminal ones, persists the round (it owns round
+	// persistence, including the no-tool-call round's model message and the
+	// accepted- or rejected-terminal call/result; the one exception is the
+	// synthetic no-tool-call nudge, which runAgentLoop persists itself via
+	// persistNudge), and decides whether the round is terminal. It returns the
+	// cost incurred this round, a non-nil *loopStop
 	// when the loop should end after this round, and any activity error. A
 	// terminal call the handler rejects (invalid record_outcome status,
 	// submit_result schema gap) is reported to the LLM as a normal error tool
@@ -66,9 +93,12 @@ type agentLoopOutcome struct {
 
 // runAgentLoop runs the shared ReAct round loop: between-round guards
 // (max_duration, cost_cap, max_rounds), BuildContext, CaseLLMStream, then
-// HandleTools. The caller owns setup (session claim/create, prompt render,
-// initial user message) and finalization (ledger write for the supervisor,
-// Outcome envelope for a native sub-agent).
+// HandleTools. It also enforces an in-round no-progress guard: after
+// maxNoToolCallNudges consecutive no-tool-call rounds it trips guardNoToolCalls
+// rather than re-invoke the LLM on a model-side-last context (#26). The caller
+// owns setup (session claim/create, prompt render, initial user message) and
+// finalization (ledger write for the supervisor, Outcome envelope for a native
+// sub-agent).
 //
 // The MaxDuration window starts when the loop starts, so the caller's setup
 // activities (claim, render, initial persist) are excluded. Pre-extraction
@@ -88,6 +118,9 @@ func runAgentLoop(ctx workflow.Context, spec agentLoopSpec) (agentLoopOutcome, e
 	})
 
 	var cumulativeCost float64
+	// noToolRounds counts CONSECUTIVE no-tool-call rounds; it drives the
+	// no-progress nudge/guard below and resets on any round with a tool call.
+	var noToolRounds int
 	// Establishes a version-marker baseline at this sequence point (#65); no
 	// branch, the cost-cap guard and cumulativeCost accumulation below
 	// (added by #66) are unconditional -- see chat.go's chat-tool-idempotency
@@ -139,8 +172,51 @@ func runAgentLoop(ctx workflow.Context, spec agentLoopSpec) (agentLoopOutcome, e
 		if stop != nil {
 			return agentLoopOutcome{Terminal: stop.Terminal, CostUSD: cumulativeCost}, nil
 		}
+
+		gstop, gout, gerr := trackNoToolCallRound(ctx, actCtx, spec, round, len(llmResult.ToolCalls) > 0, &noToolRounds, cumulativeCost)
+		if gerr != nil {
+			return agentLoopOutcome{}, gerr
+		}
+		if gstop {
+			return gout, nil
+		}
 	}
 	return agentLoopOutcome{GuardTrip: guardMaxRounds, CostUSD: cumulativeCost}, nil
+}
+
+// trackNoToolCallRound advances the consecutive no-tool-call bookkeeping after
+// a round (#26). When the round had tool calls it resets the counter and lets
+// the loop continue. When it had none, the round persisted only a model-side
+// turn, so the next BuildContext would end model-side and CaseLLMStream would
+// reject it (llm.ErrLastRoleNotUser); this nudges the model back toward its
+// terminal tool with a synthetic user turn, bounded, and after
+// maxNoToolCallNudges consecutive such rounds returns stop=true with the
+// guardNoToolCalls outcome instead of re-invoking on a model-side-last context.
+//
+// The GetVersion gate genuinely branches, unlike the unconditional baseline
+// markers in runAgentLoop: an in-flight pre-fix execution that already hit this
+// path has no marker in its history, so it resolves to DefaultVersion, skips
+// the nudge/trip, and replays its original crashing sequence deterministically.
+// The DefaultVersion arm is not covered by a test (TestWorkflowEnvironment
+// always resolves a fresh execution to version 1, and no checked-in replay
+// fixture contains a no-tool-call round); its only job is to keep those doomed
+// in-flight histories from a non-determinism panic on upgrade.
+func trackNoToolCallRound(ctx, actCtx workflow.Context, spec agentLoopSpec, round int, hadToolCalls bool, noToolRounds *int, cumulativeCost float64) (stop bool, out agentLoopOutcome, err error) { //nolint:gocritic // hugeParam: spec is value-semantic like runAgentLoop's own signature
+	if hadToolCalls {
+		*noToolRounds = 0
+		return false, agentLoopOutcome{}, nil
+	}
+	if workflow.GetVersion(ctx, "loop-no-tool-call-nudge", workflow.DefaultVersion, 1) != 1 {
+		return false, agentLoopOutcome{}, nil // old history: skip, replay the original path
+	}
+	*noToolRounds++
+	if *noToolRounds > maxNoToolCallNudges {
+		return true, agentLoopOutcome{GuardTrip: guardNoToolCalls, CostUSD: cumulativeCost}, nil
+	}
+	if perr := persistNudge(ctx, actCtx, spec.SessionID, round, spec.IdempotencyPrefix, spec.NudgeMessage); perr != nil {
+		return false, agentLoopOutcome{}, perr
+	}
+	return false, agentLoopOutcome{}, nil
 }
 
 // defaultLoopActivityCtx returns the standard activity options shared by the
@@ -174,6 +250,26 @@ func persistLoopRound(ctx, actCtx workflow.Context, sessionID uuid.UUID, round i
 		Round:          round,
 		IdempotencyKey: fmt.Sprintf("%s-%d", idemPrefix, round),
 		Messages:       msgs,
+	}).Get(ctx, nil)
+}
+
+// persistNudge persists a single synthetic user-side turn on a no-tool-call
+// round so the next BuildContext ends user-side (satisfying the llm last-role
+// guard) and the model gets one concrete instruction to call a tool. It uses
+// its own idempotency key ("<prefix>-<round>-nudge") so it never collides with
+// the round's model-message persist ("<prefix>-<round>") or a terminal persist
+// ("<prefix>-<round>-<suffix>"). msg comes from agentLoopSpec.NudgeMessage and
+// must name the loop's terminal tool.
+func persistNudge(ctx, actCtx workflow.Context, sessionID uuid.UUID, round int, idemPrefix, msg string) error {
+	return workflow.ExecuteActivity(actCtx, "PersistRound", PersistRoundRequest{
+		SessionID:      sessionID,
+		Round:          round,
+		IdempotencyKey: fmt.Sprintf("%s-%d-nudge", idemPrefix, round),
+		Messages: []ActivityMessage{{
+			Role:          ctxbuild.RoleUser,
+			Content:       msg,
+			TokenEstimate: estimateTokens(msg),
+		}},
 	}).Get(ctx, nil)
 }
 
