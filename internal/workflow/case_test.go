@@ -512,8 +512,13 @@ func TestCaseWorkflow_MaxRoundsExhausted_NeedsAttention(t *testing.T) {
 	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(&BuildContextResult{}, nil)
 	env.OnActivity(acts.chatActs.PersistRound, mock.Anything, mock.Anything).Return(nil)
+	// Each round calls a non-terminal (unknown) tool so it is NOT a no-tool-call
+	// round: a text-only round would trip guardNoToolCalls after two nudges (#26)
+	// whenever MaxRounds exceeds maxNoToolCallNudges. A tool call every round keeps
+	// noToolRounds reset, so this test pins the max_rounds path regardless of the
+	// nudge threshold rather than relying on MaxRounds == maxNoToolCallNudges.
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).Return(
-		&CaseLLMStreamResult{Text: "still working on it"}, nil,
+		&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "noop-c0", Name: "noop"}}}, nil,
 	)
 
 	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
@@ -526,6 +531,126 @@ func TestCaseWorkflow_MaxRoundsExhausted_NeedsAttention(t *testing.T) {
 	finArgs := getFinArgs()
 	assert.Equal(t, store.TaskStatusNeedsAttention, finArgs.Status)
 	assertOutcomeReason(t, finArgs.Outcome, guardMaxRounds)
+}
+
+// TestCaseWorkflow_NoToolCallRound_NudgesThenRecovers pins the #26 fix: a round
+// with no tool calls must persist a synthetic user nudge (so the next context
+// ends user-side instead of tripping ErrLastRoleNotUser) and the loop must
+// continue, letting the model recover on the next round.
+func TestCaseWorkflow_NoToolCallRound_NudgesThenRecovers(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	acts := registerCaseActivities(env)
+
+	env.OnActivity(acts.monitor.ClaimCase, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(&BuildContextResult{}, nil)
+	getPersists := capturePersistRounds(t, env, acts.chatActs.PersistRound)
+	// Round 1: no tool calls (empty model turn). Round 2: recovers.
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Return(&CaseLLMStreamResult{}, nil).Once()
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{recordOutcomeCall("c2", store.TaskStatusDone)}}, nil).Once()
+	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
+
+	env.ExecuteWorkflow(CaseWorkflow, testCaseInput())
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	var out CaseOutcome
+	require.NoError(t, env.GetWorkflowResult(&out))
+	assert.Equal(t, store.TaskStatusDone, out.Status)
+	assert.Equal(t, store.TaskStatusDone, getFinArgs().Status)
+
+	// The no-tool-call round persisted exactly one user-side nudge (round 1).
+	// The recover path alone would still finalize done, so this assertion is
+	// what fails if the persistNudge call is removed.
+	nudges := nudgePersists(getPersists())
+	require.Len(t, nudges, 1, "exactly one -nudge persist expected (round 1)")
+	n := nudges[0]
+	assert.Equal(t, 1, n.Round)
+	assert.True(t, strings.HasPrefix(n.IdempotencyKey, "case-"), "nudge key prefix case-, got %q", n.IdempotencyKey)
+	assert.True(t, strings.HasSuffix(n.IdempotencyKey, "-1-nudge"), "nudge key round 1, got %q", n.IdempotencyKey)
+	require.Len(t, n.Messages, 1)
+	assert.Equal(t, ctxbuild.RoleUser, n.Messages[0].Role)
+	// Pin the exact nudge against the exported constant, not a substring: a
+	// truncated or reworded nudge that still named record_outcome would slip a
+	// substring check.
+	assert.Equal(t, supervisorNoToolNudge, n.Messages[0].Content)
+}
+
+// TestCaseWorkflow_NoToolCallRounds_FinalizeNeedsAttention pins the bound: after
+// maxNoToolCallNudges consecutive no-tool-call rounds the loop gives up with the
+// no_tool_calls guard (needs_attention), well before max_rounds.
+func TestCaseWorkflow_NoToolCallRounds_FinalizeNeedsAttention(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	acts := registerCaseActivities(env)
+
+	env.OnActivity(acts.monitor.ClaimCase, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(&BuildContextResult{}, nil)
+	getPersists := capturePersistRounds(t, env, acts.chatActs.PersistRound)
+	var llmCalls int
+	// Every round empty (no .Once()); default MaxRounds is 10, so max_rounds
+	// cannot mask the no_tool_calls trip.
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { llmCalls++ }).
+		Return(&CaseLLMStreamResult{}, nil)
+	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
+
+	env.ExecuteWorkflow(CaseWorkflow, testCaseInput())
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	finArgs := getFinArgs()
+	assert.Equal(t, store.TaskStatusNeedsAttention, finArgs.Status)
+	assertOutcomeReason(t, finArgs.Outcome, guardNoToolCalls)
+	// 1 initial empty round + maxNoToolCallNudges nudged rounds, then the trip.
+	assert.Equal(t, 1+maxNoToolCallNudges, llmCalls)
+	// Only the nudged rounds persist a nudge; the tripping round persists none.
+	assert.Len(t, nudgePersists(getPersists()), maxNoToolCallNudges)
+}
+
+// TestCaseWorkflow_NoToolCallCounter_ResetsOnToolCallRound pins the consecutive
+// (not cumulative) counting: a tool-calling round between empty rounds resets
+// the nudge count, so two more empty rounds nudge again rather than trip.
+func TestCaseWorkflow_NoToolCallCounter_ResetsOnToolCallRound(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	acts := registerCaseActivities(env)
+
+	env.OnActivity(acts.monitor.ClaimCase, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(&BuildContextResult{}, nil)
+	getPersists := capturePersistRounds(t, env, acts.chatActs.PersistRound)
+	var llmCalls int
+	countLLM := func(mock.Arguments) { llmCalls++ }
+	// Two full nudge blocks of maxNoToolCallNudges empty rounds, separated by a
+	// non-terminal tool round that resets the counter, then record_outcome.
+	// Counts derive from maxNoToolCallNudges so they cannot silently drift if
+	// the bound changes. With the default (2): empty,empty,tool,empty,empty,done.
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(maxNoToolCallNudges)
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "c-tool", Name: "noop"}}}, nil).Once()
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(maxNoToolCallNudges)
+	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
+		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{recordOutcomeCall("c-done", store.TaskStatusDone)}}, nil).Once()
+	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
+
+	env.ExecuteWorkflow(CaseWorkflow, testCaseInput())
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Equal(t, store.TaskStatusDone, getFinArgs().Status)
+	// 2 nudge blocks + the reset tool round + the record_outcome round. If the
+	// reset were missing, the second block's second empty round would trip
+	// no_tool_calls early and this count would be lower.
+	assert.Equal(t, 2*maxNoToolCallNudges+2, llmCalls, "the reset must let the loop reach record_outcome, not trip at the bound")
+	// One nudge per empty round in both blocks; none on the tool round or the terminal round.
+	assert.Len(t, nudgePersists(getPersists()), 2*maxNoToolCallNudges)
 }
 
 func TestCaseWorkflow_CostCapExceeded_NeedsAttention(t *testing.T) {
@@ -771,6 +896,18 @@ func assertAcceptedTerminalPersisted(t *testing.T, persistCalls []PersistRoundRe
 	}
 	assert.True(t, sawCall, "the accepted persist must include the %s tool_call", toolName)
 	assert.True(t, sawResult, "the accepted persist must include a tool_result confirming acceptance")
+}
+
+// nudgePersists returns the persisted rounds written under a no-tool-call nudge
+// idempotency key ("<prefix>-<round>-nudge"). Shared by the #26 guard tests.
+func nudgePersists(calls []PersistRoundRequest) []PersistRoundRequest {
+	var out []PersistRoundRequest
+	for _, c := range calls {
+		if strings.HasSuffix(c.IdempotencyKey, "-nudge") {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // persistedToolResultContains reports whether any persisted round holds a

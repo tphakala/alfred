@@ -35,7 +35,11 @@ declared-command tools). The engine stays generic.
 2. **Level 1 Case Supervisor** (`CaseWorkflow`): one autonomous LLM ReAct loop
    per candidate, on the native provider (Vertex/OpenRouter). Tools: the
    deployment's declared commands, plus reserved `spawn_agent` and
-   `record_outcome`. Guarded by `max_rounds`, `cost_cap_usd`, `max_duration`.
+   `record_outcome`. Guarded by `max_rounds`, `cost_cap_usd`, `max_duration`,
+   and a no-progress guard: a round with no tool calls is nudged back toward
+   `record_outcome`, and after two such nudges (on the third consecutive
+   no-tool-call round) the case finalizes `needs_attention` (reason
+   `no_tool_calls`) rather than crash.
 3. **Level 2 Sub-Agents:** `backend: native` (a schema-bound LLM loop, terminal
    tools `submit_result`/`report_failure`) or `backend: cli` (an
    `ExternalAgentWorkflow`), interchangeable from the supervisor's view.
@@ -234,8 +238,10 @@ Never delete or unpause the two production schedules
   real load** and cannot sustain a tool loop. Use a paid endpoint (e.g.
   `openai/gpt-oss-120b` without `:free`). Verified live.
 - **The model must do reliable tool-calling.** A weak model duplicates tool
-  calls across rounds and emits empty/no-tool-call rounds (see Known
-  Limitations). Model quality is a real dependency for multi-step tasks.
+  calls across rounds and emits empty/no-tool-call rounds (the loop now nudges
+  those, then finalizes `no_tool_calls`, but a model that cannot tool-call
+  reliably still burns the nudge budget without progress). Model quality is a
+  real dependency for multi-step tasks.
 - **Cost metering:** `cost_cap_usd` only meters models present in
   `llm.DefaultPriceTable` (Gemini models) or the config `pricing` overlay. An
   unpriced model (e.g. `gpt-oss-120b`) contributes zero to the meter (logged
@@ -253,7 +259,8 @@ than trust the model.
   once" is intended (edit-in-place / upsert), so an over-eager model converges
   to one result instead of spamming.
 - **Bounded everything:** `max_rounds`, `cost_cap_usd`, `max_duration`,
-  `max_parallel_cases`, `max_case_attempts`.
+  `max_parallel_cases`, `max_case_attempts`, and an internal no-progress bound
+  (a no-tool-call round is nudged at most twice before the loop gives up).
 - **Terminal tools:** the supervisor ends with `record_outcome`; a native
   sub-agent ends with `submit_result` / `report_failure`. A loop that never
   reaches its terminal tool is a bug to bound, not a model to trust.
@@ -263,15 +270,19 @@ than trust the model.
 - Level 0+1 supervised orchestration works end-to-end live (proven by
   `sandbox-issue-triage`: dispatch, multi-round supervisor loop, declared-command
   execution, real bot comments/labels).
-- **#130 (open):** the agent loop crashes on a no-tool-call round. When the model
-  returns a round with no tool calls, the loop persists a model-side turn and
-  re-invokes the LLM with a model-side-last context, failing the last-role guard
-  (`ErrLastRoleNotUser`); the case sticks `in_progress`. Fix direction: finalize
-  or nudge, never re-invoke on a model-side-last context. Affects any model.
+- **#26 (resolved):** the agent loop no longer crashes on a no-tool-call round.
+  Previously, when the model returned a round with no tool calls, the loop
+  persisted a model-side turn and re-invoked the LLM with a model-side-last
+  context, failing the last-role guard (`ErrLastRoleNotUser`) and sticking the
+  case `in_progress`. The loop now persists a synthetic user nudge steering the
+  model back toward its terminal tool and, after two such nudges (on the third
+  consecutive no-tool-call round), finalizes `no_tool_calls` (supervisor:
+  `needs_attention`; native sub-agent: `failed`) instead of re-invoking on a
+  model-side-last context. Affected any model.
 - **Duplicate tool calls:** a weak model re-calls a non-idempotent tool each
   round (observed: 3-5 duplicate comments). Mitigate with idempotent tool design
-  (section above), the #130 fix, a capable model, and prompt hardening. Do not
-  rely on the model alone.
+  (section above), the no-tool-call handling (#26), a capable model, and prompt
+  hardening. Do not rely on the model alone.
 - **#128 (open):** latent mapper edge cases in the unused structured tool-call
   path (OpenRouter drops `Text` alongside `ToolResults`; empty-message asymmetry).
 - **Milestone 2 not yet exercised:** sub-agent `spawn_agent` + PR-filing.

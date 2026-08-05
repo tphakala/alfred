@@ -318,3 +318,49 @@ func TestTieredContextBuilder_EmptyMessages(t *testing.T) {
 		t.Errorf("expected TokensUsed=0, got %d", result.TokensUsed)
 	}
 }
+
+// TestTieredContextBuilder_PreservesTrailingUserNudge guards the invariant the
+// #26 supervised-loop fix relies on: after a no-tool-call round the loop
+// persists a model turn followed by a synthetic user "nudge", and BuildContext
+// must leave that user turn LAST so the rebuilt context ends user-side (which
+// the llm last-role guard requires) instead of re-tripping ErrLastRoleNotUser.
+// The nudge is the newest message and is a user turn, so newest-first fill must
+// keep it and stale-tool-result pruning (which only stubs tool_result content)
+// must never touch it. Aggressive stale threshold (1) forces the older
+// tool_result to be pruning-eligible, proving the trailing user turn survives
+// regardless. If a future change reordered messages or dropped the trailing
+// user turn, this fails and the #26 crash would otherwise return silently.
+func TestTieredContextBuilder_PreservesTrailingUserNudge(t *testing.T) {
+	builder := NewTieredContextBuilder(1)
+
+	const nudge = "[system] call a tool to make progress"
+	messages := []StoredMessage{
+		{Sequence: 1, Role: RoleUser, Content: "work the task", TokenEstimate: 5},
+		{Sequence: 2, Role: RoleToolCall, Content: "some_tool", TokenEstimate: 3},
+		{Sequence: 3, Role: RoleToolResult, Content: "an older tool result", TokenEstimate: 5},
+		{Sequence: 4, Role: RoleModel, Content: "", TokenEstimate: 0},   // the no-tool-call round's model turn
+		{Sequence: 5, Role: RoleUser, Content: nudge, TokenEstimate: 6}, // the synthetic nudge
+	}
+
+	params := BuildParams{
+		SessionID:   uuid.New(),
+		TokenBudget: 1000, // large enough that nothing is budget-dropped
+		Messages:    messages,
+	}
+
+	result, err := builder.Build(t.Context(), &params)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Messages) == 0 {
+		t.Fatal("expected a non-empty context")
+	}
+
+	last := result.Messages[len(result.Messages)-1]
+	if last.Role != RoleUser {
+		t.Fatalf("context must end on a user-side turn (the nudge), got role %q", last.Role)
+	}
+	if last.Content != nudge {
+		t.Fatalf("trailing user turn should be the nudge, got %q", last.Content)
+	}
+}
