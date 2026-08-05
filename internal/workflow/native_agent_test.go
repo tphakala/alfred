@@ -246,7 +246,8 @@ func TestNativeSubAgentWorkflow_NoToolCallRounds_FinalizeFailed(t *testing.T) {
 		assert.True(t, strings.HasPrefix(n.IdempotencyKey, "agent-"), "native nudge key prefix agent-, got %q", n.IdempotencyKey)
 		require.Len(t, n.Messages, 1)
 		assert.Equal(t, ctxbuild.RoleUser, n.Messages[0].Role)
-		assert.Contains(t, n.Messages[0].Content, "submit_result")
+		// Exact-pin the native nudge against its constant, not a substring.
+		assert.Equal(t, nativeNoToolNudge, n.Messages[0].Content)
 	}
 }
 

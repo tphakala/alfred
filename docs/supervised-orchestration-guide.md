@@ -37,8 +37,9 @@ declared-command tools). The engine stays generic.
    deployment's declared commands, plus reserved `spawn_agent` and
    `record_outcome`. Guarded by `max_rounds`, `cost_cap_usd`, `max_duration`,
    and a no-progress guard: a round with no tool calls is nudged back toward
-   `record_outcome`, and after two consecutive such rounds the case finalizes
-   `needs_attention` (reason `no_tool_calls`) rather than crash.
+   `record_outcome`, and after two such nudges (on the third consecutive
+   no-tool-call round) the case finalizes `needs_attention` (reason
+   `no_tool_calls`) rather than crash.
 3. **Level 2 Sub-Agents:** `backend: native` (a schema-bound LLM loop, terminal
    tools `submit_result`/`report_failure`) or `backend: cli` (an
    `ExternalAgentWorkflow`), interchangeable from the supervisor's view.
@@ -274,10 +275,10 @@ than trust the model.
   persisted a model-side turn and re-invoked the LLM with a model-side-last
   context, failing the last-role guard (`ErrLastRoleNotUser`) and sticking the
   case `in_progress`. The loop now persists a synthetic user nudge steering the
-  model back toward its terminal tool and, after two consecutive no-tool-call
-  rounds, finalizes `no_tool_calls` (supervisor: `needs_attention`; native
-  sub-agent: `failed`) instead of re-invoking on a model-side-last context.
-  Affected any model.
+  model back toward its terminal tool and, after two such nudges (on the third
+  consecutive no-tool-call round), finalizes `no_tool_calls` (supervisor:
+  `needs_attention`; native sub-agent: `failed`) instead of re-invoking on a
+  model-side-last context. Affected any model.
 - **Duplicate tool calls:** a weak model re-calls a non-idempotent tool each
   round (observed: 3-5 duplicate comments). Mitigate with idempotent tool design
   (section above), the no-tool-call handling (#26), a capable model, and prompt

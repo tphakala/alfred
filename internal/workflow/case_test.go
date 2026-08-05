@@ -512,8 +512,13 @@ func TestCaseWorkflow_MaxRoundsExhausted_NeedsAttention(t *testing.T) {
 	env.OnActivity(acts.chatActs.BuildContext, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(&BuildContextResult{}, nil)
 	env.OnActivity(acts.chatActs.PersistRound, mock.Anything, mock.Anything).Return(nil)
+	// Each round calls a non-terminal (unknown) tool so it is NOT a no-tool-call
+	// round: a text-only round would trip guardNoToolCalls after two nudges (#26)
+	// whenever MaxRounds exceeds maxNoToolCallNudges. A tool call every round keeps
+	// noToolRounds reset, so this test pins the max_rounds path regardless of the
+	// nudge threshold rather than relying on MaxRounds == maxNoToolCallNudges.
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).Return(
-		&CaseLLMStreamResult{Text: "still working on it"}, nil,
+		&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "noop-c0", Name: "noop"}}}, nil,
 	)
 
 	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
@@ -568,8 +573,10 @@ func TestCaseWorkflow_NoToolCallRound_NudgesThenRecovers(t *testing.T) {
 	assert.True(t, strings.HasSuffix(n.IdempotencyKey, "-1-nudge"), "nudge key round 1, got %q", n.IdempotencyKey)
 	require.Len(t, n.Messages, 1)
 	assert.Equal(t, ctxbuild.RoleUser, n.Messages[0].Role)
-	assert.Contains(t, n.Messages[0].Content, "[system]")
-	assert.Contains(t, n.Messages[0].Content, "record_outcome")
+	// Pin the exact nudge against the exported constant, not a substring: a
+	// truncated or reworded nudge that still named record_outcome would slip a
+	// substring check.
+	assert.Equal(t, supervisorNoToolNudge, n.Messages[0].Content)
 }
 
 // TestCaseWorkflow_NoToolCallRounds_FinalizeNeedsAttention pins the bound: after
@@ -619,16 +626,18 @@ func TestCaseWorkflow_NoToolCallCounter_ResetsOnToolCallRound(t *testing.T) {
 	getPersists := capturePersistRounds(t, env, acts.chatActs.PersistRound)
 	var llmCalls int
 	countLLM := func(mock.Arguments) { llmCalls++ }
-	// Rounds 1-2 empty (nudge, nudge); round 3 a non-terminal tool (resets);
-	// rounds 4-5 empty (nudge, nudge); round 6 record_outcome -> done.
+	// Two full nudge blocks of maxNoToolCallNudges empty rounds, separated by a
+	// non-terminal tool round that resets the counter, then record_outcome.
+	// Counts derive from maxNoToolCallNudges so they cannot silently drift if
+	// the bound changes. With the default (2): empty,empty,tool,empty,empty,done.
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
-		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(2)
+		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(maxNoToolCallNudges)
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
-		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "c3", Name: "noop"}}}, nil).Once()
+		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{{CallID: "c-tool", Name: "noop"}}}, nil).Once()
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
-		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(2)
+		Run(countLLM).Return(&CaseLLMStreamResult{}, nil).Times(maxNoToolCallNudges)
 	env.OnActivity(acts.caseActs.CaseLLMStream, mock.Anything, mock.Anything).
-		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{recordOutcomeCall("c6", store.TaskStatusDone)}}, nil).Once()
+		Run(countLLM).Return(&CaseLLMStreamResult{ToolCalls: []LLMToolCall{recordOutcomeCall("c-done", store.TaskStatusDone)}}, nil).Once()
 	getFinArgs := captureFinalizeCase(t, env, acts.monitor.FinalizeCase)
 
 	env.ExecuteWorkflow(CaseWorkflow, testCaseInput())
@@ -636,9 +645,12 @@ func TestCaseWorkflow_NoToolCallCounter_ResetsOnToolCallRound(t *testing.T) {
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
 	assert.Equal(t, store.TaskStatusDone, getFinArgs().Status)
-	assert.Equal(t, 6, llmCalls, "the reset must let the loop reach round 6 instead of tripping at round 4")
-	// Nudges on rounds 1, 2, 4, 5 (not 3, which had a tool call, nor 6).
-	assert.Len(t, nudgePersists(getPersists()), 4)
+	// 2 nudge blocks + the reset tool round + the record_outcome round. If the
+	// reset were missing, the second block's second empty round would trip
+	// no_tool_calls early and this count would be lower.
+	assert.Equal(t, 2*maxNoToolCallNudges+2, llmCalls, "the reset must let the loop reach record_outcome, not trip at the bound")
+	// One nudge per empty round in both blocks; none on the tool round or the terminal round.
+	assert.Len(t, nudgePersists(getPersists()), 2*maxNoToolCallNudges)
 }
 
 func TestCaseWorkflow_CostCapExceeded_NeedsAttention(t *testing.T) {
